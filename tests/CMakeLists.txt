@@ -1,0 +1,4 @@
+add_executable(test_model_animation test_model_animation.c)
+target_link_libraries(test_model_animation PRIVATE raylib)
+
+add_test(NAME model_animation_blending COMMAND test_model_animation)

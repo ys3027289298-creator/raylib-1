@@ -182,6 +182,9 @@ static void ProcessMaterialsOBJ(Material *rayMaterials, tinyobj_material_t *mate
 // Update model vertex data (positions and normals)
 static void UpdateModelAnimationVertexBuffers(Model model);
 
+// Update model bone matrices, blending two animation poses
+static void UpdateModelAnimationBonesBlend(Model model, ModelAnimation animA, float frameA, ModelAnimation animB, float frameB, float blend);
+
 //----------------------------------------------------------------------------------
 // Module Functions Definition
 //----------------------------------------------------------------------------------
@@ -2304,61 +2307,124 @@ ModelAnimation *LoadModelAnimations(const char *fileName, int *animCount)
     return animations;
 }
 
+// Get animation frame pair and interpolation factor for a fractional frame
+// NOTE: Each animation is sampled using its own keyframe count, so clips
+// with different frame rates or durations can be mixed safely
+static bool GetModelAnimationFrameData(const ModelAnimation *anim, float frame, int *currentFrame, int *nextFrame, float *frameBlend)
+{
+    bool result = false;
+
+    if ((anim != NULL) && (anim->keyframeCount > 0) && (anim->keyframePoses != NULL))
+    {
+        float normalizedFrame = fmodf(frame, (float)anim->keyframeCount);
+        if (normalizedFrame < 0.0f) normalizedFrame += (float)anim->keyframeCount;
+
+        int frameIndex = (int)normalizedFrame;
+        if (frameIndex >= anim->keyframeCount) frameIndex = anim->keyframeCount - 1;
+
+        *currentFrame = frameIndex;
+        *nextFrame = (frameIndex + 1)%anim->keyframeCount;
+        *frameBlend = Clamp(normalizedFrame - frameIndex, 0.0f, 1.0f);
+        result = true;
+    }
+
+    return result;
+}
+
+// Get bind-pose transform for a bone, falling back to identity if unavailable
+static Transform GetModelAnimationBindPoseTransform(Model model, unsigned int boneIndex)
+{
+    Transform transform = { 0 };
+    transform.rotation.w = 1.0f;
+    transform.scale = (Vector3){ 1.0f, 1.0f, 1.0f };
+
+    if ((model.skeleton.bindPose != NULL) && (boneIndex < model.skeleton.boneCount))
+        transform = model.skeleton.bindPose[boneIndex];
+
+    return transform;
+}
+
+// Get interpolated pose for a bone from an animation
+// NOTE: Missing bones fall back to the skeleton bind pose to avoid out-of-bounds
+// reads and discontinuities when animation bone counts do not match
+static Transform GetModelAnimationPoseTransform(const ModelAnimation *anim, int currentFrame, int nextFrame,
+    float frameBlend, unsigned int boneIndex, Transform fallbackPose)
+{
+    Transform pose = fallbackPose;
+
+    if ((anim != NULL) && (anim->keyframePoses != NULL) && (boneIndex < anim->boneCount))
+    {
+        Transform *currentFramePose = anim->keyframePoses[currentFrame];
+        Transform *nextFramePose = anim->keyframePoses[nextFrame];
+
+        if ((currentFramePose != NULL) && (nextFramePose != NULL))
+        {
+            pose.translation = Vector3Lerp(currentFramePose[boneIndex].translation, nextFramePose[boneIndex].translation, frameBlend);
+            pose.rotation = QuaternionSlerp(currentFramePose[boneIndex].rotation, nextFramePose[boneIndex].rotation, frameBlend);
+            pose.scale = Vector3Lerp(currentFramePose[boneIndex].scale, nextFramePose[boneIndex].scale, frameBlend);
+        }
+        else if (currentFramePose != NULL) pose = currentFramePose[boneIndex];
+        else if (nextFramePose != NULL) pose = nextFramePose[boneIndex];
+    }
+
+    return pose;
+}
+
+// Get transform matrix from pose transform
+static Matrix GetModelAnimationTransformMatrix(Transform transform)
+{
+    Matrix matrix = MatrixMultiply(
+        MatrixMultiply(MatrixScale(transform.scale.x, transform.scale.y, transform.scale.z),
+            QuaternionToMatrix(transform.rotation)),
+        MatrixTranslate(transform.translation.x, transform.translation.y, transform.translation.z));
+
+    return matrix;
+}
+
+// Update model animation bones blending two animation poses
+static void UpdateModelAnimationBonesBlend(Model model, ModelAnimation animA, float frameA, ModelAnimation animB, float frameB, float blend)
+{
+    if ((model.boneMatrices == NULL) || (model.currentPose == NULL) ||
+        (model.skeleton.bones == NULL) || (model.skeleton.bindPose == NULL)) return;
+    if ((blend < 0.0f) || (blend > 1.0f)) return;
+
+    int currentFrameA = 0;
+    int nextFrameA = 0;
+    int currentFrameB = 0;
+    int nextFrameB = 0;
+    float frameBlendA = 0.0f;
+    float frameBlendB = 0.0f;
+
+    bool animationAValid = GetModelAnimationFrameData(&animA, frameA, &currentFrameA, &nextFrameA, &frameBlendA);
+    bool animationBValid = GetModelAnimationFrameData(&animB, frameB, &currentFrameB, &nextFrameB, &frameBlendB);
+
+    if (!animationAValid || !animationBValid) return;
+
+    // Update all bones and bone matrices of model
+    for (unsigned int boneIndex = 0; boneIndex < model.skeleton.boneCount; boneIndex++)
+    {
+        Transform bindPose = GetModelAnimationBindPoseTransform(model, boneIndex);
+        Transform poseA = GetModelAnimationPoseTransform(&animA, currentFrameA, nextFrameA, frameBlendA, boneIndex, bindPose);
+        Transform poseB = GetModelAnimationPoseTransform(&animB, currentFrameB, nextFrameB, frameBlendB, boneIndex, bindPose);
+
+        // Compute interpolated pose between both animations
+        // NOTE: Storing animation frame data in model.currentPose
+        model.currentPose[boneIndex].translation = Vector3Lerp(poseA.translation, poseB.translation, blend);
+        model.currentPose[boneIndex].rotation = QuaternionSlerp(poseA.rotation, poseB.rotation, blend);
+        model.currentPose[boneIndex].scale = Vector3Lerp(poseA.scale, poseB.scale, blend);
+
+        // Compute runtime bone matrix from model current pose
+        Matrix bindPoseMatrix = GetModelAnimationTransformMatrix(bindPose);
+        Matrix currentPoseMatrix = GetModelAnimationTransformMatrix(model.currentPose[boneIndex]);
+        model.boneMatrices[boneIndex] = MatrixMultiply(MatrixInvert(bindPoseMatrix), currentPoseMatrix);
+    }
+}
+
 // Update model animation data (bone matrices) for a specific pose
 // NOTE 1: Request frame could be fractional, using a lerp interpolation between two frames
 void UpdateModelAnimationBones(Model model, ModelAnimation anim, float frame)
 {
-    if (model.boneMatrices == NULL) return;
-
-    //UpdateModelAnimationEx(model, anim, frame, anim, frame, 0.0f);
-
-    // Update model animated bones transform matrices for a given frame
-    if ((anim.keyframeCount > 0) && (model.skeleton.bones != NULL) && (anim.keyframePoses != NULL))
-    {
-        // Get frame and blending from frame factor required
-        int currentFrame = (int)frame;
-        int nextFrame = currentFrame + 1;
-        float blend = frame - currentFrame;
-        blend = Clamp(blend, 0.0f, 1.0f);
-        if (currentFrame >= anim.keyframeCount) currentFrame = currentFrame%anim.keyframeCount;
-        if (nextFrame >= anim.keyframeCount) nextFrame = nextFrame%anim.keyframeCount;
-
-        Matrix bindPoseMatrix = { 0 };
-        Matrix currentPoseMatrix = { 0 };
-
-        // Update all bones and bone matrices of model
-        for (unsigned int boneIndex = 0; boneIndex < model.skeleton.boneCount; boneIndex++)
-        {
-            // Compute interpolated pose between current and next frame
-            // NOTE: Storing animation frame data in model.currentPose
-            model.currentPose[boneIndex].translation = Vector3Lerp(
-                anim.keyframePoses[currentFrame][boneIndex].translation,
-                anim.keyframePoses[nextFrame][boneIndex].translation, blend);
-            model.currentPose[boneIndex].rotation = QuaternionSlerp(
-                anim.keyframePoses[currentFrame][boneIndex].rotation,
-                anim.keyframePoses[nextFrame][boneIndex].rotation, blend);
-            model.currentPose[boneIndex].scale = Vector3Lerp(
-                anim.keyframePoses[currentFrame][boneIndex].scale,
-                anim.keyframePoses[nextFrame][boneIndex].scale, blend);
-
-            // Compute runtime bone matrix from model current pose
-            //-----------------------------------------------------------------------------------
-            Transform *bindPoseTransform = &model.skeleton.bindPose[boneIndex];
-            bindPoseMatrix = MatrixMultiply(
-                MatrixMultiply(MatrixScale(bindPoseTransform->scale.x, bindPoseTransform->scale.y, bindPoseTransform->scale.z),
-                    QuaternionToMatrix(bindPoseTransform->rotation)),
-                MatrixTranslate(bindPoseTransform->translation.x, bindPoseTransform->translation.y, bindPoseTransform->translation.z));
-
-            Transform *currentPoseTransform = &model.currentPose[boneIndex];
-            currentPoseMatrix = MatrixMultiply(
-                MatrixMultiply(MatrixScale(currentPoseTransform->scale.x, currentPoseTransform->scale.y, currentPoseTransform->scale.z),
-                    QuaternionToMatrix(currentPoseTransform->rotation)),
-                MatrixTranslate(currentPoseTransform->translation.x, currentPoseTransform->translation.y, currentPoseTransform->translation.z));
-
-            model.boneMatrices[boneIndex] = MatrixMultiply(MatrixInvert(bindPoseMatrix), currentPoseMatrix);
-            //-----------------------------------------------------------------------------------
-        }
-    }
+    UpdateModelAnimationBonesBlend(model, anim, frame, anim, frame, 0.0f);
 }
 
 // Update model animation data (vertex buffers / bone matrices) for a specific pose
@@ -2380,110 +2446,10 @@ void UpdateModelAnimation(Model model, ModelAnimation anim, float frame)
 // Update model animation data (bone matrices) for a specific pose,
 // defined by two different animations at specific frames blended together
 // NOTE 1: Request frames could be fractional, using a lerp interpolation between two frames
+// NOTE 2: Blending is performed independently per bone, missing bones use bind pose
 void UpdateModelAnimationBonesEx(Model model, ModelAnimation animA, float frameA, ModelAnimation animB, float frameB, float blend)
 {
-    if (model.boneMatrices == NULL) return;
-
-    if ((animA.keyframeCount > 0) && (animA.keyframePoses != NULL) &&
-        (animB.keyframeCount > 0) && (animB.keyframePoses != NULL) &&
-        (blend >= 0.0f) && (blend <= 1.0f))
-    {
-        // Inter-frame interpolation values for first animation
-        int currentFrameA = (int)frameA%animA.keyframeCount;
-        int nextFrameA = currentFrameA + 1;
-        float blendA = frameA - currentFrameA;
-        blendA = Clamp(blendA, 0.0f, 1.0f);
-        if (currentFrameA >= animA.keyframeCount) currentFrameA = currentFrameA%animA.keyframeCount;
-        if (nextFrameA >= animA.keyframeCount) nextFrameA = nextFrameA%animA.keyframeCount;
-
-        // Inter-frame interpolation values for second animation
-        int currentFrameB = (int)frameB%animB.keyframeCount;
-        int nextFrameB = currentFrameB + 1;
-        float blendB = frameB - currentFrameB;
-        blendB = Clamp(blendB, 0.0f, 1.0f);
-        if (currentFrameB >= animB.keyframeCount) currentFrameB = currentFrameB%animB.keyframeCount;
-        if (nextFrameB >= animB.keyframeCount) nextFrameB = nextFrameB%animB.keyframeCount;
-
-        Matrix bindPoseMatrix = { 0 };
-        Matrix currentPoseMatrix = { 0 };
-
-        for (unsigned int boneIndex = 0; boneIndex < model.skeleton.boneCount; boneIndex++)
-        {
-            // Get frame-interpolation for first animation
-            Vector3 frameATranslation = Vector3Lerp(
-                animA.keyframePoses[currentFrameA][boneIndex].translation,
-                animA.keyframePoses[nextFrameA][boneIndex].translation, blendA);
-            Quaternion frameARotation = QuaternionSlerp(
-                animA.keyframePoses[currentFrameA][boneIndex].rotation,
-                animA.keyframePoses[nextFrameA][boneIndex].rotation, blendA);
-            Vector3 frameAScale = Vector3Lerp(
-                animA.keyframePoses[currentFrameA][boneIndex].scale,
-                animA.keyframePoses[nextFrameA][boneIndex].scale, blendA);
-
-            // Get frame-interpolation for second animation
-            Vector3 frameBTranslation = Vector3Lerp(
-                animB.keyframePoses[currentFrameB][boneIndex].translation,
-                animB.keyframePoses[nextFrameB][boneIndex].translation, blendB);
-            Quaternion frameBRotation = QuaternionSlerp(
-                animB.keyframePoses[currentFrameB][boneIndex].rotation,
-                animB.keyframePoses[nextFrameB][boneIndex].rotation, blendB);
-            Vector3 frameBScale = Vector3Lerp(
-                animB.keyframePoses[currentFrameB][boneIndex].scale,
-                animB.keyframePoses[nextFrameB][boneIndex].scale, blendB);
-
-            // Compute interpolated pose between both animations frames
-            // NOTE: Storing animation frame data in model.currentPose
-            model.currentPose[boneIndex].translation = Vector3Lerp(frameATranslation, frameBTranslation, blend);
-            model.currentPose[boneIndex].rotation = QuaternionSlerp(frameARotation, frameBRotation, blend);
-            model.currentPose[boneIndex].scale = Vector3Lerp(frameAScale, frameBScale, blend);
-
-            // Compute runtime bone matrix from model current pose
-            //-----------------------------------------------------------------------------------
-            Transform *bindPoseTransform = &model.skeleton.bindPose[boneIndex];
-            bindPoseMatrix = MatrixMultiply(
-                MatrixMultiply(MatrixScale(bindPoseTransform->scale.x, bindPoseTransform->scale.y, bindPoseTransform->scale.z),
-                    QuaternionToMatrix(bindPoseTransform->rotation)),
-                MatrixTranslate(bindPoseTransform->translation.x, bindPoseTransform->translation.y, bindPoseTransform->translation.z));
-
-            Transform *currentPoseTransform = &model.currentPose[boneIndex];
-            currentPoseMatrix = MatrixMultiply(
-                MatrixMultiply(MatrixScale(currentPoseTransform->scale.x, currentPoseTransform->scale.y, currentPoseTransform->scale.z),
-                    QuaternionToMatrix(currentPoseTransform->rotation)),
-                MatrixTranslate(currentPoseTransform->translation.x, currentPoseTransform->translation.y, currentPoseTransform->translation.z));
-
-            model.boneMatrices[boneIndex] = MatrixMultiply(MatrixInvert(bindPoseMatrix), currentPoseMatrix);
-            //-----------------------------------------------------------------------------------
-
-            /*
-            Vector3 outATranslation = animA.keyframePoses[currentFrameA][boneIndex].translation;
-            Quaternion outARotation = animA.keyframePoses[currentFrameA][boneIndex].rotation;
-            Vector3 outAScale = animA.keyframePoses[currentFrameA][boneIndex].scale;
-
-            Vector3 outBTranslation = animB.keyframePoses[currentFrameB][boneIndex].translation;
-            Quaternion outBRotation = animB.keyframePoses[currentFrameB][boneIndex].rotation;
-            Vector3 outBScale = animB.keyframePoses[currentFrameB][boneIndex].scale;
-
-            // Invert bind pose transformation
-            Vector3 invBindTranslation = Vector3RotateByQuaternion(
-                Vector3Negate(model.skeleton.bindPose[boneIndex].translation),
-                QuaternionInvert(model.skeleton.bindPose[boneIndex].rotation));
-            Quaternion invBindRotation = QuaternionInvert(model.skeleton.bindPose[boneIndex].rotation);
-            Vector3 invBindScale = Vector3Divide((Vector3){ 1.0f, 1.0f, 1.0f }, model.skeleton.bindPose[boneIndex].scale);
-
-            Vector3 boneTranslation = Vector3Add(Vector3RotateByQuaternion(
-                Vector3Multiply(model.currentPose[boneIndex].scale, invBindTranslation),
-                    model.currentPose[boneIndex].rotation),
-                    model.currentPose[boneIndex].translation);
-            Quaternion boneRotation = QuaternionMultiply(model.currentPose[boneIndex].rotation, invBindRotation);
-            Vector3 boneScale = Vector3Multiply(model.currentPose[boneIndex].scale, invBindScale);
-
-            model.boneMatrices[boneIndex] = MatrixMultiply(
-                MatrixMultiply(QuaternionToMatrix(boneRotation),
-                    MatrixTranslate(boneTranslation.x, boneTranslation.y, boneTranslation.z)),
-                MatrixScale(boneScale.x, boneScale.y, boneScale.z));
-            */
-        }
-    }
+    UpdateModelAnimationBonesBlend(model, animA, frameA, animB, frameB, blend);
 }
 
 // Update model animation data (vertex buffers / bone matrices) for a specific pose,
@@ -2505,6 +2471,53 @@ void UpdateModelAnimationEx(Model model, ModelAnimation animA, float frameA, Mod
         // NOTE: Fallback in case GPU skinning is not supported or enabled
         UpdateModelAnimationVertexBuffers(model);
     }
+}
+
+// Get model animation transition weight from elapsed time
+// NOTE: elapsedTime and duration are in seconds, result is always in [0..1]
+float GetModelAnimationTransitionWeight(float elapsedTime, float duration, ModelAnimationEasing easing)
+{
+    float blend = 0.0f;
+
+    if (duration <= 0.0f) blend = 1.0f;
+    else blend = Clamp(elapsedTime/duration, 0.0f, 1.0f);
+
+    switch (easing)
+    {
+        case MODEL_ANIMATION_EASING_SINE_IN: blend = 1.0f - cosf(blend*PI/2.0f); break;
+        case MODEL_ANIMATION_EASING_SINE_OUT: blend = sinf(blend*PI/2.0f); break;
+        case MODEL_ANIMATION_EASING_SINE_IN_OUT: blend = (1.0f - cosf(blend*PI))/2.0f; break;
+        case MODEL_ANIMATION_EASING_CUBIC_IN: blend = blend*blend*blend; break;
+        case MODEL_ANIMATION_EASING_CUBIC_OUT:
+        {
+            float inverse = 1.0f - blend;
+            blend = 1.0f - inverse*inverse*inverse;
+        } break;
+        case MODEL_ANIMATION_EASING_CUBIC_IN_OUT:
+        {
+            if (blend < 0.5f) blend = 4.0f*blend*blend*blend;
+            else
+            {
+                float inverse = -2.0f*blend + 2.0f;
+                blend = 1.0f - (inverse*inverse*inverse)/2.0f;
+            }
+        } break;
+        case MODEL_ANIMATION_EASING_SMOOTHSTEP: blend = blend*blend*(3.0f - 2.0f*blend); break;
+        case MODEL_ANIMATION_EASING_LINEAR:
+        default: break;
+    }
+
+    return Clamp(blend, 0.0f, 1.0f);
+}
+
+// Update model animation pose using a time-based transition between two animations
+// NOTE: frameA/frameB are independent clip frames, caller can advance them using
+// each animation own frame rate; duration/elapsedTime are in seconds
+void UpdateModelAnimationTransition(Model model, ModelAnimation animA, float frameA, ModelAnimation animB, float frameB,
+    float duration, float elapsedTime, ModelAnimationEasing easing)
+{
+    float blend = GetModelAnimationTransitionWeight(elapsedTime, duration, easing);
+    UpdateModelAnimationEx(model, animA, frameA, animB, frameB, blend);
 }
 
 // Update model vertex animation buffers (positions and normals)

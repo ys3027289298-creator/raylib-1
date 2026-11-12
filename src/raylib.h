@@ -398,6 +398,18 @@ typedef struct Transform {
     Vector3 scale;          // Scale
 } Transform;
 
+// Model animation transition easing curve
+typedef enum {
+    MODEL_ANIMATION_EASING_LINEAR = 0,      // Linear transition speed
+    MODEL_ANIMATION_EASING_SINE_IN,         // Starts slow and accelerates
+    MODEL_ANIMATION_EASING_SINE_OUT,        // Starts fast and decelerates
+    MODEL_ANIMATION_EASING_SINE_IN_OUT,     // Slow at both ends
+    MODEL_ANIMATION_EASING_CUBIC_IN,        // Cubic acceleration
+    MODEL_ANIMATION_EASING_CUBIC_OUT,       // Cubic deceleration
+    MODEL_ANIMATION_EASING_CUBIC_IN_OUT,    // Cubic acceleration and deceleration
+    MODEL_ANIMATION_EASING_SMOOTHSTEP      // Smoothstep acceleration and deceleration
+} ModelAnimationEasing;
+
 // Anim pose, an array of Transform[]
 typedef Transform *ModelAnimPose;
 
@@ -1661,6 +1673,8 @@ RLAPI void SetModelMeshMaterial(Model *model, int meshId, int materialId);      
 RLAPI ModelAnimation *LoadModelAnimations(const char *fileName, int *animCount);            // Load model animations from file
 RLAPI void UpdateModelAnimation(Model model, ModelAnimation anim, float frame);             // Update model animation pose (vertex buffers and bone matrices)
 RLAPI void UpdateModelAnimationEx(Model model, ModelAnimation animA, float frameA, ModelAnimation animB, float frameB, float blend); // Update model animation pose, blending two animations
+RLAPI void UpdateModelAnimationTransition(Model model, ModelAnimation animA, float frameA, ModelAnimation animB, float frameB, float duration, float elapsedTime, ModelAnimationEasing easing); // Update pose with time-based transition (frames independent, times in seconds)
+RLAPI float GetModelAnimationTransitionWeight(float elapsedTime, float duration, ModelAnimationEasing easing); // Get eased transition weight from elapsed and duration in seconds
 RLAPI void UnloadModelAnimations(ModelAnimation *animations, int animCount);                // Unload animation array data
 RLAPI bool IsModelAnimationValid(Model model, ModelAnimation anim);                         // Check model animation skeleton match
 
