@@ -6,6 +6,8 @@
 *       - Manage audio device (init/close)
 *       - Manage raw audio context
 *       - Manage mixing channels
+ *       - Manage audio buses for grouped source routing, volume and mute control
+ *       - Manage audio effects (low-pass, reverb), attachable to sources and buses
 *       - Load and unload audio files
 *       - Format wave data (sample rate, size, channels)
 *       - Play/Stop/Pause/Resume loaded audio
@@ -180,6 +182,7 @@ typedef struct tagBITMAPINFOHEADER {
 #include <stdlib.h>                     // Required for: malloc(), free()
 #include <stdio.h>                      // Required for: FILE, fopen(), fclose(), fread()
 #include <string.h>                     // Required for: strcmp() [Used in IsFileExtension(), LoadWaveFromMemory(), LoadMusicStreamFromMemory()]
+#include <math.h>                       // Required for: sinf(), cosf(), expf(), fabsf() [Used in audio effects]
 
 #if defined(RAUDIO_STANDALONE)
     #ifndef TRACELOG
@@ -303,6 +306,22 @@ typedef struct tagBITMAPINFOHEADER {
     #define AUDIO_BUFFER_RESIDUAL_CAPACITY     8    // In PCM frames, for resampling and pitch shifting
 #endif
 
+#ifndef AUDIO_BUS_BUFFER_FRAMES
+    #define AUDIO_BUS_BUFFER_FRAMES           1024    // Max frames processed per mixing chunk, no dynamic allocation on the audio thread
+#endif
+
+#ifndef AUDIO_PARAMETER_SMOOTHING_SECONDS
+    #define AUDIO_PARAMETER_SMOOTHING_SECONDS 0.005f  // Smoothing time for bus/effect parameter changes, avoids zipper noise
+#endif
+
+// Optional timing hooks for the device callback, used by tests to measure mixing cost
+#ifndef RAUDIO_CALLBACK_TIMER_START
+    #define RAUDIO_CALLBACK_TIMER_START()  0ULL
+#endif
+#ifndef RAUDIO_CALLBACK_TIMER_END
+    #define RAUDIO_CALLBACK_TIMER_END(start) (void)(start)
+#endif
+
 //----------------------------------------------------------------------------------
 // Types and Structures Definition
 //----------------------------------------------------------------------------------
@@ -350,6 +369,8 @@ struct rAudioBuffer {
 
     AudioCallback callback;         // Audio buffer callback for buffer filling on audio threads
     rAudioProcessor *processor;     // Audio processor
+    rAudioEffect *effects;          // Audio effects chain attached to this buffer
+    rAudioBus *bus;                 // Audio bus this buffer is routed to (NULL routes to the master bus)
 
     float volume;                   // Audio buffer volume
     float pitch;                    // Audio buffer pitch
@@ -381,6 +402,70 @@ struct rAudioProcessor {
 
 #define AudioBuffer rAudioBuffer    // WARNING: Renamed to avoid symbol collision with CoreAudio (macOS) AudioBuffer type
 
+// Audio effect owner types
+// NOTE: An effect can only be attached to a single owner at a time
+typedef enum {
+    AUDIO_EFFECT_OWNER_NONE = 0,    // Effect is not attached anywhere
+    AUDIO_EFFECT_OWNER_BUFFER,      // Effect is attached to an AudioBuffer (single source)
+    AUDIO_EFFECT_OWNER_BUS          // Effect is attached to an rAudioBus (group of sources)
+} AudioEffectOwnerType;
+
+// Audio effect struct
+// NOTE: Effects are processed on the audio thread, parameters are smoothed to avoid zipper noise
+struct rAudioEffect {
+    int type;                       // Effect type (AudioEffectType)
+    float parameter[4];             // Target parameter values (AudioEffectParameter)
+    float smoothedParameter[4];     // Smoothed parameter values, updated per sample on the audio thread
+    void *state;                    // Effect type specific state
+    bool tailActive;                // Effect keeps producing output without input (e.g. reverb tail)
+
+    void *owner;                    // Current owner: AudioBuffer* or rAudioBus* (NULL if detached)
+    int ownerType;                  // Current owner type (AudioEffectOwnerType)
+    struct rAudioEffect *next;      // Next effect on the owner chain
+};
+
+// Audio bus struct
+// NOTE: Sources routed to a bus are accumulated into its mix buffer,
+// then effects and a smoothed gain are applied before mixing into the master bus
+struct rAudioBus {
+    float volume;                   // Target bus volume
+    bool muted;                     // Bus mute state
+    float gain;                     // Smoothed gain currently applied (volume x mute)
+
+    float mix[AUDIO_BUS_BUFFER_FRAMES*2];   // Accumulation buffer (stereo)
+
+    rAudioEffect *effects;          // Audio effects chain attached to this bus
+
+    bool isMaster;                  // Master bus flag, the master bus can not be unloaded
+    struct rAudioBus *next;         // Next audio bus on the list
+    struct rAudioBus *prev;         // Previous audio bus on the list
+};
+
+// Low-pass filter state (stereo biquad, Butterworth Q)
+typedef struct LowpassState {
+    float b0, b1, b2;               // Feed-forward coefficients
+    float a1, a2;                   // Feedback coefficients
+    float x1[2], x2[2];             // Input history, per channel
+    float y1[2], y2[2];             // Output history, per channel
+} LowpassState;
+
+// Reverb defines (Freeverb-style delay network)
+#define REVERB_COMB_COUNT        8  // Parallel feedback comb filters per channel
+#define REVERB_ALLPASS_COUNT     2  // Series allpass filters per channel
+#define REVERB_INPUT_GAIN     0.25f // Input attenuation to keep the network stable and avoid clipping
+
+// Reverb state (stereo, slightly detuned per channel for width)
+typedef struct ReverbState {
+    float *combBuffer[2][REVERB_COMB_COUNT];    // Comb delay lines
+    int combLength[2][REVERB_COMB_COUNT];       // Comb delay lengths in frames
+    int combIndex[2][REVERB_COMB_COUNT];        // Comb delay line cursors
+    float combStore[2][REVERB_COMB_COUNT];      // Comb damping filter stores
+    float *allpassBuffer[2][REVERB_ALLPASS_COUNT];  // Allpass delay lines
+    int allpassLength[2][REVERB_ALLPASS_COUNT];     // Allpass delay lengths in frames
+    int allpassIndex[2][REVERB_ALLPASS_COUNT];      // Allpass delay line cursors
+    float envelope;                         // Output envelope follower, used for tail detection
+} ReverbState;
+
 // Audio data context
 typedef struct AudioData {
     struct {
@@ -390,12 +475,18 @@ typedef struct AudioData {
         bool isReady;               // Check if audio device is ready
         size_t pcmBufferSize;       // Pre-allocated buffer size
         void *pcmBuffer;            // Pre-allocated buffer to read audio data from file/memory
+        float parameterSmoothing;   // Smoothing coefficient for bus/effect parameter changes
     } System;
     struct {
         AudioBuffer *first;         // Pointer to first AudioBuffer in the list
         AudioBuffer *last;          // Pointer to last AudioBuffer in the list
         int defaultSize;            // Default audio buffer size for audio streams
     } Buffer;
+    struct {
+        rAudioBus *first;           // Pointer to first user audio bus in the list
+        rAudioBus *last;            // Pointer to last user audio bus in the list
+        rAudioBus master;           // Master audio bus, every source finally mixes into it
+    } Bus;
     rAudioProcessor *mixedProcessor;
 } AudioData;
 
@@ -423,6 +514,11 @@ static ma_uint32 ReadAudioBufferFramesInMixingFormat(AudioBuffer *audioBuffer, f
 
 static void OnSendAudioDataToDevice(ma_device *pDevice, void *pFramesOut, const void *pFramesInput, ma_uint32 frameCount);
 static void MixAudioFrames(float *framesOut, const float *framesIn, ma_uint32 frameCount, AudioBuffer *buffer);
+static void MixAudioBusFrames(float *framesOut, rAudioBus *bus, ma_uint32 frameCount);
+
+static void ProcessAudioEffectChain(rAudioEffect *effect, float *frames, ma_uint32 frameCount);
+static bool IsAudioEffectChainTailActive(rAudioEffect *effect);
+static void DetachAudioEffectFromOwnerInLockedState(rAudioEffect *effect);
 
 static bool IsAudioBufferPlayingInLockedState(AudioBuffer *buffer);
 static void StopAudioBufferInLockedState(AudioBuffer *buffer);
@@ -526,6 +622,16 @@ void InitAudioDevice(void)
     TRACELOG(LOG_INFO, "    > Sample rate:   %d -> %d", AUDIO.System.device.sampleRate, AUDIO.System.device.playback.internalSampleRate);
     TRACELOG(LOG_INFO, "    > Periods size:  %d", AUDIO.System.device.playback.internalPeriodSizeInFrames*AUDIO.System.device.playback.internalPeriods);
 
+    // Init the master audio bus, every source routes to it by default
+    AUDIO.Bus.master.volume = 1.0f;
+    AUDIO.Bus.master.muted = false;
+    AUDIO.Bus.master.gain = 1.0f;
+    AUDIO.Bus.master.effects = NULL;
+    AUDIO.Bus.master.isMaster = true;
+
+    // Smoothing coefficient for bus/effect parameter changes, avoids zipper noise
+    AUDIO.System.parameterSmoothing = 1.0f - expf(-1.0f/(AUDIO_PARAMETER_SMOOTHING_SECONDS*(float)AUDIO.System.device.sampleRate));
+
     AUDIO.System.isReady = true;
 }
 
@@ -609,6 +715,8 @@ AudioBuffer *LoadAudioBuffer(ma_format format, ma_uint32 channels, ma_uint32 sam
 
     audioBuffer->callback = NULL;
     audioBuffer->processor = NULL;
+    audioBuffer->effects = NULL;
+    audioBuffer->bus = NULL;
 
     audioBuffer->playing = false;
     audioBuffer->paused = false;
@@ -636,6 +744,12 @@ void UnloadAudioBuffer(AudioBuffer *buffer)
     if (buffer != NULL)
     {
         UntrackAudioBuffer(buffer);
+
+        // Detach any effects still attached to this buffer
+        ma_mutex_lock(&AUDIO.System.lock);
+        while (buffer->effects != NULL) DetachAudioEffectFromOwnerInLockedState(buffer->effects);
+        ma_mutex_unlock(&AUDIO.System.lock);
+
         ma_data_converter_uninit(&buffer->converter, NULL);
         RL_FREE(buffer->converterResidual);
         RL_FREE(buffer->data);
@@ -2346,8 +2460,356 @@ void DetachAudioMixedProcessor(AudioCallback process)
 }
 
 //----------------------------------------------------------------------------------
+// Module Functions Definition - Audio Bus management
+//----------------------------------------------------------------------------------
+
+// Load an audio bus
+// NOTE: Sources routed to the bus are mixed together, then bus effects
+// and a smoothed bus gain are applied before mixing into the master bus
+AudioBus LoadAudioBus(void)
+{
+    rAudioBus *bus = (rAudioBus *)RL_CALLOC(1, sizeof(rAudioBus));
+
+    bus->volume = 1.0f;
+    bus->muted = false;
+    bus->gain = 1.0f;       // Start at full gain, no fade-in on creation
+    bus->effects = NULL;
+    bus->isMaster = false;
+
+    ma_mutex_lock(&AUDIO.System.lock);
+    {
+        if (AUDIO.Bus.first == NULL) AUDIO.Bus.first = bus;
+        else
+        {
+            AUDIO.Bus.last->next = bus;
+            bus->prev = AUDIO.Bus.last;
+        }
+
+        AUDIO.Bus.last = bus;
+    }
+    ma_mutex_unlock(&AUDIO.System.lock);
+
+    return bus;
+}
+
+// Unload an audio bus
+// NOTE: Sources routed to the bus are moved back to the master bus,
+// attached effects are detached (not unloaded)
+void UnloadAudioBus(AudioBus bus)
+{
+    if (bus == NULL) return;
+
+    if (bus->isMaster)
+    {
+        TRACELOG(LOG_WARNING, "AUDIO: The master bus can not be unloaded");
+        return;
+    }
+
+    ma_mutex_lock(&AUDIO.System.lock);
+    {
+        // Re-route sources using this bus back to the master bus
+        for (AudioBuffer *audioBuffer = AUDIO.Buffer.first; audioBuffer != NULL; audioBuffer = audioBuffer->next)
+        {
+            if (audioBuffer->bus == bus) audioBuffer->bus = NULL;
+        }
+
+        // Detach effects still attached to this bus
+        while (bus->effects != NULL) DetachAudioEffectFromOwnerInLockedState(bus->effects);
+
+        // Untrack the bus from the list
+        if (bus->prev == NULL) AUDIO.Bus.first = bus->next;
+        else bus->prev->next = bus->next;
+
+        if (bus->next == NULL) AUDIO.Bus.last = bus->prev;
+        else bus->next->prev = bus->prev;
+    }
+    ma_mutex_unlock(&AUDIO.System.lock);
+
+    RL_FREE(bus);
+}
+
+// Check if an audio bus is valid
+bool IsAudioBusValid(AudioBus bus)
+{
+    return (bus != NULL);
+}
+
+// Get the master audio bus
+AudioBus GetMasterAudioBus(void)
+{
+    return &AUDIO.Bus.master;
+}
+
+// Set volume for an audio bus (1.0 is max level)
+// NOTE: Volume changes are smoothed on the audio thread to avoid zipper noise
+void SetAudioBusVolume(AudioBus bus, float volume)
+{
+    if (bus != NULL)
+    {
+        ma_mutex_lock(&AUDIO.System.lock);
+        bus->volume = volume;
+        ma_mutex_unlock(&AUDIO.System.lock);
+    }
+}
+
+// Get current volume for an audio bus
+float GetAudioBusVolume(AudioBus bus)
+{
+    return (bus != NULL) ? bus->volume : 0.0f;
+}
+
+// Set mute state for an audio bus
+// NOTE: Mute transitions are smoothed on the audio thread to avoid clicks
+void SetAudioBusMuted(AudioBus bus, bool muted)
+{
+    if (bus != NULL)
+    {
+        ma_mutex_lock(&AUDIO.System.lock);
+        bus->muted = muted;
+        ma_mutex_unlock(&AUDIO.System.lock);
+    }
+}
+
+// Check if an audio bus is muted
+bool IsAudioBusMuted(AudioBus bus)
+{
+    return (bus != NULL) ? bus->muted : false;
+}
+
+// Route a sound to an audio bus
+// NOTE: Use NULL to route the sound back to the master bus
+void SetSoundAudioBus(Sound sound, AudioBus bus)
+{
+    if (sound.stream.buffer != NULL)
+    {
+        ma_mutex_lock(&AUDIO.System.lock);
+        sound.stream.buffer->bus = bus;
+        ma_mutex_unlock(&AUDIO.System.lock);
+    }
+}
+
+//----------------------------------------------------------------------------------
+// Module Functions Definition - Audio Effect management
+//----------------------------------------------------------------------------------
+
+// Load an audio effect of the given type (AudioEffectType)
+AudioEffect LoadAudioEffect(int type)
+{
+    rAudioEffect *effect = (rAudioEffect *)RL_CALLOC(1, sizeof(rAudioEffect));
+
+    effect->type = type;
+    effect->owner = NULL;
+    effect->ownerType = AUDIO_EFFECT_OWNER_NONE;
+    effect->tailActive = false;
+
+    switch (type)
+    {
+        case AUDIO_EFFECT_LOWPASS:
+        {
+            // Parameter 1: cutoff frequency (Hz), defaults to fully open
+            effect->parameter[0] = 20000.0f;
+            effect->parameter[1] = 0.0f;
+            effect->parameter[2] = 0.0f;
+            effect->parameter[3] = 0.0f;
+
+            effect->state = RL_CALLOC(1, sizeof(LowpassState));
+        } break;
+        case AUDIO_EFFECT_REVERB:
+        {
+            // Parameters: room size, damping, wet level, dry level (0..1)
+            effect->parameter[0] = 0.5f;
+            effect->parameter[1] = 0.5f;
+            effect->parameter[2] = 0.3f;
+            effect->parameter[3] = 0.7f;
+
+            // Freeverb delay tunings, defined at 44100 Hz and scaled to the device sample rate
+            static const int combTunings[REVERB_COMB_COUNT] = { 1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617 };
+            static const int allpassTunings[REVERB_ALLPASS_COUNT] = { 556, 441 };
+            const int stereoSpread = 23;
+
+            unsigned int sampleRate = AUDIO.System.isReady ? AUDIO.System.device.sampleRate : 48000;
+
+            ReverbState *state = (ReverbState *)RL_CALLOC(1, sizeof(ReverbState));
+
+            for (int c = 0; c < 2; c++)
+            {
+                for (int i = 0; i < REVERB_COMB_COUNT; i++)
+                {
+                    int length = (int)((float)(combTunings[i] + c*stereoSpread)*(float)sampleRate/44100.0f + 0.5f);
+                    state->combBuffer[c][i] = (float *)RL_CALLOC(length, sizeof(float));
+                    state->combLength[c][i] = length;
+                }
+
+                for (int i = 0; i < REVERB_ALLPASS_COUNT; i++)
+                {
+                    int length = (int)((float)(allpassTunings[i] + c*stereoSpread)*(float)sampleRate/44100.0f + 0.5f);
+                    state->allpassBuffer[c][i] = (float *)RL_CALLOC(length, sizeof(float));
+                    state->allpassLength[c][i] = length;
+                }
+            }
+
+            effect->state = state;
+        } break;
+        default:
+        {
+            TRACELOG(LOG_WARNING, "AUDIO: Unknown effect type requested: %i", type);
+            RL_FREE(effect);
+            return NULL;
+        }
+    }
+
+    // Smoothed parameters start at their targets
+    for (int i = 0; i < 4; i++) effect->smoothedParameter[i] = effect->parameter[i];
+
+    return effect;
+}
+
+// Unload an audio effect
+// NOTE: The effect is detached from its current owner first
+void UnloadAudioEffect(AudioEffect effect)
+{
+    if (effect == NULL) return;
+
+    ma_mutex_lock(&AUDIO.System.lock);
+    DetachAudioEffectFromOwnerInLockedState(effect);
+    ma_mutex_unlock(&AUDIO.System.lock);
+
+    if (effect->type == AUDIO_EFFECT_REVERB)
+    {
+        ReverbState *state = (ReverbState *)effect->state;
+
+        for (int c = 0; c < 2; c++)
+        {
+            for (int i = 0; i < REVERB_COMB_COUNT; i++) RL_FREE(state->combBuffer[c][i]);
+            for (int i = 0; i < REVERB_ALLPASS_COUNT; i++) RL_FREE(state->allpassBuffer[c][i]);
+        }
+    }
+
+    RL_FREE(effect->state);
+    RL_FREE(effect);
+}
+
+// Check if an audio effect is valid
+bool IsAudioEffectValid(AudioEffect effect)
+{
+    return (effect != NULL);
+}
+
+// Set an audio effect parameter (AudioEffectParameter)
+// NOTE: Parameter changes are smoothed on the audio thread to avoid zipper noise
+void SetAudioEffectParameter(AudioEffect effect, int parameter, float value)
+{
+    if ((effect != NULL) && (parameter >= 0) && (parameter < 4))
+    {
+        ma_mutex_lock(&AUDIO.System.lock);
+        effect->parameter[parameter] = value;
+        ma_mutex_unlock(&AUDIO.System.lock);
+    }
+}
+
+// Get an audio effect parameter current target value
+float GetAudioEffectParameter(AudioEffect effect, int parameter)
+{
+    float value = 0.0f;
+
+    if ((effect != NULL) && (parameter >= 0) && (parameter < 4)) value = effect->parameter[parameter];
+
+    return value;
+}
+
+// Attach an audio effect to an audio bus
+// NOTE: An effect can only be attached to one owner at a time,
+// attaching an already attached effect detaches it from its previous owner
+void AttachAudioBusEffect(AudioBus bus, AudioEffect effect)
+{
+    if ((bus == NULL) || (effect == NULL)) return;
+
+    ma_mutex_lock(&AUDIO.System.lock);
+    {
+        DetachAudioEffectFromOwnerInLockedState(effect);
+
+        effect->next = bus->effects;
+        bus->effects = effect;
+        effect->owner = bus;
+        effect->ownerType = AUDIO_EFFECT_OWNER_BUS;
+    }
+    ma_mutex_unlock(&AUDIO.System.lock);
+}
+
+// Detach an audio effect from an audio bus
+// NOTE: The effect is detached from its current owner, whatever it is
+void DetachAudioBusEffect(AudioBus bus, AudioEffect effect)
+{
+    (void)bus;
+
+    if (effect == NULL) return;
+
+    ma_mutex_lock(&AUDIO.System.lock);
+    DetachAudioEffectFromOwnerInLockedState(effect);
+    ma_mutex_unlock(&AUDIO.System.lock);
+}
+
+// Attach an audio effect to an audio stream
+// NOTE: An effect can only be attached to one owner at a time,
+// attaching an already attached effect detaches it from its previous owner
+void AttachAudioStreamEffect(AudioStream stream, AudioEffect effect)
+{
+    if ((stream.buffer == NULL) || (effect == NULL)) return;
+
+    ma_mutex_lock(&AUDIO.System.lock);
+    {
+        DetachAudioEffectFromOwnerInLockedState(effect);
+
+        effect->next = stream.buffer->effects;
+        stream.buffer->effects = effect;
+        effect->owner = stream.buffer;
+        effect->ownerType = AUDIO_EFFECT_OWNER_BUFFER;
+    }
+    ma_mutex_unlock(&AUDIO.System.lock);
+}
+
+// Detach an audio effect from an audio stream
+// NOTE: The effect is detached from its current owner, whatever it is
+void DetachAudioStreamEffect(AudioStream stream, AudioEffect effect)
+{
+    (void)stream;
+
+    if (effect == NULL) return;
+
+    ma_mutex_lock(&AUDIO.System.lock);
+    DetachAudioEffectFromOwnerInLockedState(effect);
+    ma_mutex_unlock(&AUDIO.System.lock);
+}
+
+//----------------------------------------------------------------------------------
 // Module Internal Functions Definition
 //----------------------------------------------------------------------------------
+
+// Detach an audio effect from its current owner, assuming the audio system mutex has been locked
+static void DetachAudioEffectFromOwnerInLockedState(rAudioEffect *effect)
+{
+    if ((effect == NULL) || (effect->owner == NULL)) return;
+
+    if (effect->ownerType == AUDIO_EFFECT_OWNER_BUFFER)
+    {
+        AudioBuffer *owner = (AudioBuffer *)effect->owner;
+        rAudioEffect **link = &owner->effects;
+        while ((*link != NULL) && (*link != effect)) link = &(*link)->next;
+        if (*link == effect) *link = effect->next;
+    }
+    else if (effect->ownerType == AUDIO_EFFECT_OWNER_BUS)
+    {
+        rAudioBus *owner = (rAudioBus *)effect->owner;
+        rAudioEffect **link = &owner->effects;
+        while ((*link != NULL) && (*link != effect)) link = &(*link)->next;
+        if (*link == effect) *link = effect->next;
+    }
+
+    effect->owner = NULL;
+    effect->ownerType = AUDIO_EFFECT_OWNER_NONE;
+    effect->next = NULL;
+}
+
 // Log callback function
 static void OnLog(void *pUserData, ma_uint32 level, const char *pMessage)
 {
@@ -2537,32 +2999,44 @@ static void OnSendAudioDataToDevice(ma_device *pDevice, void *pFramesOut, const 
 {
     (void)pDevice;
 
+    unsigned long long callbackTimerStart = RAUDIO_CALLBACK_TIMER_START();
+
     // Mixing is basically an accumulation, need to initialize the output buffer to 0
     memset(pFramesOut, 0, frameCount*pDevice->playback.channels*ma_get_bytes_per_sample(pDevice->playback.format));
 
     // Using a mutex here for thread-safety which makes things not real-time
     // This is unlikely to be necessary for this project, but it can be reconsidered
     ma_mutex_lock(&AUDIO.System.lock);
+
+    // Mixing is done in chunks limited to the pre-allocated bus buffers,
+    // so no dynamic allocation is ever required on the audio thread
+    ma_uint32 framesMixed = 0;
+    while (framesMixed < frameCount)
     {
+        ma_uint32 chunkFrames = frameCount - framesMixed;
+        if (chunkFrames > AUDIO_BUS_BUFFER_FRAMES) chunkFrames = AUDIO_BUS_BUFFER_FRAMES;
+
+        // Clear bus accumulation buffers
+        for (rAudioBus *bus = AUDIO.Bus.first; bus != NULL; bus = bus->next)
+        {
+            memset(bus->mix, 0, chunkFrames*AUDIO_DEVICE_CHANNELS*sizeof(float));
+        }
+        memset(AUDIO.Bus.master.mix, 0, chunkFrames*AUDIO_DEVICE_CHANNELS*sizeof(float));
+
+        // Mix every playing audio buffer into its assigned bus
         for (AudioBuffer *audioBuffer = AUDIO.Buffer.first; audioBuffer != NULL; audioBuffer = audioBuffer->next)
         {
-            // Ignore stopped or paused sounds
-            if (!audioBuffer->playing || audioBuffer->paused) continue;
+            rAudioBus *bus = (audioBuffer->bus != NULL) ? audioBuffer->bus : &AUDIO.Bus.master;
 
-            ma_uint32 framesRead = 0;
-
-            while (1)
+            if (audioBuffer->playing && !audioBuffer->paused)
             {
-                if (framesRead >= frameCount) break;
+                ma_uint32 framesRead = 0;
 
-                // Read as much data as possible from the stream
-                ma_uint32 framesToRead = (frameCount - framesRead);
-
-                while (framesToRead > 0)
+                while (framesRead < chunkFrames)
                 {
                     float tempBuffer[1024] = { 0 }; // Frames for stereo
 
-                    ma_uint32 framesToReadRightNow = framesToRead;
+                    ma_uint32 framesToReadRightNow = chunkFrames - framesRead;
                     if (framesToReadRightNow > (1024/AUDIO_DEVICE_CHANNELS))
                     {
                         framesToReadRightNow = (1024/AUDIO_DEVICE_CHANNELS);
@@ -2571,28 +3045,23 @@ static void OnSendAudioDataToDevice(ma_device *pDevice, void *pFramesOut, const 
                     ma_uint32 framesJustRead = ReadAudioBufferFramesInMixingFormat(audioBuffer, tempBuffer, framesToReadRightNow);
                     if (framesJustRead > 0)
                     {
-                        float *framesOut = (float *)pFramesOut + (framesRead*AUDIO.System.device.playback.channels);
-                        float *framesIn = tempBuffer;
-
                         // Apply processors chain if defined
                         rAudioProcessor *processor = audioBuffer->processor;
                         while (processor)
                         {
-                            processor->process(framesIn, framesJustRead);
+                            processor->process(tempBuffer, framesJustRead);
                             processor = processor->next;
                         }
 
-                        MixAudioFrames(framesOut, framesIn, framesJustRead, audioBuffer);
+                        // Apply per-source effects chain if defined
+                        ProcessAudioEffectChain(audioBuffer->effects, tempBuffer, framesJustRead);
 
-                        framesToRead -= framesJustRead;
+                        MixAudioFrames(bus->mix + (framesRead*AUDIO_DEVICE_CHANNELS), tempBuffer, framesJustRead, audioBuffer);
+
                         framesRead += framesJustRead;
                     }
 
-                    if (!audioBuffer->playing)
-                    {
-                        framesRead = frameCount;
-                        break;
-                    }
+                    if (!audioBuffer->playing) break;
 
                     // If all the frames requested can't be read, break
                     if (framesJustRead < framesToReadRightNow)
@@ -2611,12 +3080,57 @@ static void OnSendAudioDataToDevice(ma_device *pDevice, void *pFramesOut, const 
                         }
                     }
                 }
+            }
+            else if (IsAudioEffectChainTailActive(audioBuffer->effects))
+            {
+                // The source is stopped or paused but its effects still produce
+                // an audible tail (e.g. reverb), keep feeding silence through
+                // the chain and mix the remaining tail into the bus
+                ma_uint32 framesProcessed = 0;
 
-                // If for some reason is not possible to read every frame, the loop needs to be broken
-                // Not doing this could theoretically eend up into an infinite loop
-                if (framesToRead > 0) break;
+                while (framesProcessed < chunkFrames)
+                {
+                    float tempBuffer[1024] = { 0 }; // Frames for stereo
+
+                    ma_uint32 framesToProcess = chunkFrames - framesProcessed;
+                    if (framesToProcess > (1024/AUDIO_DEVICE_CHANNELS))
+                    {
+                        framesToProcess = (1024/AUDIO_DEVICE_CHANNELS);
+                    }
+
+                    ProcessAudioEffectChain(audioBuffer->effects, tempBuffer, framesToProcess);
+                    MixAudioFrames(bus->mix + (framesProcessed*AUDIO_DEVICE_CHANNELS), tempBuffer, framesToProcess, audioBuffer);
+
+                    framesProcessed += framesToProcess;
+                }
             }
         }
+
+        // Mix every user bus into the master bus, applying effects and smoothed gain
+        for (rAudioBus *bus = AUDIO.Bus.first; bus != NULL; bus = bus->next)
+        {
+            ProcessAudioEffectChain(bus->effects, bus->mix, chunkFrames);
+            MixAudioBusFrames(AUDIO.Bus.master.mix, bus, chunkFrames);
+        }
+
+        // Master bus: apply effects, smoothed gain and accumulate to the output
+        ProcessAudioEffectChain(AUDIO.Bus.master.effects, AUDIO.Bus.master.mix, chunkFrames);
+        {
+            float *framesOut = (float *)pFramesOut + (framesMixed*AUDIO.System.device.playback.channels);
+            float targetGain = AUDIO.Bus.master.muted ? 0.0f : AUDIO.Bus.master.volume;
+            float gain = AUDIO.Bus.master.gain;
+
+            for (ma_uint32 frame = 0; frame < chunkFrames; frame++)
+            {
+                gain += (targetGain - gain)*AUDIO.System.parameterSmoothing;
+                framesOut[frame*2 + 0] += AUDIO.Bus.master.mix[frame*2 + 0]*gain;
+                framesOut[frame*2 + 1] += AUDIO.Bus.master.mix[frame*2 + 1]*gain;
+            }
+
+            AUDIO.Bus.master.gain = gain;
+        }
+
+        framesMixed += chunkFrames;
     }
 
     rAudioProcessor *processor = AUDIO.mixedProcessor;
@@ -2627,6 +3141,8 @@ static void OnSendAudioDataToDevice(ma_device *pDevice, void *pFramesOut, const 
     }
 
     ma_mutex_unlock(&AUDIO.System.lock);
+
+    RAUDIO_CALLBACK_TIMER_END(callbackTimerStart);
 }
 
 // Main mixing function, pretty simple in this project, only an accumulation
@@ -2670,6 +3186,155 @@ static void MixAudioFrames(float *framesOut, const float *framesIn, ma_uint32 fr
             }
         }
     }
+}
+
+// Mix bus frames into the master mix buffer, applying the smoothed bus gain
+// NOTE: The gain ramps smoothly towards the target (volume x mute) to avoid clicks
+static void MixAudioBusFrames(float *framesOut, rAudioBus *bus, ma_uint32 frameCount)
+{
+    float targetGain = bus->muted ? 0.0f : bus->volume;
+    float gain = bus->gain;
+
+    for (ma_uint32 frame = 0; frame < frameCount; frame++)
+    {
+        gain += (targetGain - gain)*AUDIO.System.parameterSmoothing;
+        framesOut[frame*2 + 0] += bus->mix[frame*2 + 0]*gain;
+        framesOut[frame*2 + 1] += bus->mix[frame*2 + 1]*gain;
+    }
+
+    bus->gain = gain;
+}
+
+// Process a low-pass effect (stereo biquad, Butterworth Q)
+// NOTE: The cutoff frequency is smoothed per sample and coefficients are
+// recomputed at control rate to avoid zipper noise
+static void ProcessAudioEffectLowpass(rAudioEffect *effect, float *frames, ma_uint32 frameCount)
+{
+    LowpassState *state = (LowpassState *)effect->state;
+    float sampleRate = (float)AUDIO.System.device.sampleRate;
+
+    for (ma_uint32 frame = 0; frame < frameCount; frame++)
+    {
+        // Smooth the cutoff frequency towards its target
+        effect->smoothedParameter[0] += (effect->parameter[0] - effect->smoothedParameter[0])*AUDIO.System.parameterSmoothing;
+
+        if ((frame & 31) == 0)
+        {
+            // Recompute coefficients at control rate (RBJ biquad, Butterworth)
+            float cutoff = effect->smoothedParameter[0];
+            if (cutoff < 10.0f) cutoff = 10.0f;
+            if (cutoff > sampleRate*0.45f) cutoff = sampleRate*0.45f;
+
+            float omega = 2.0f*(float)PI*cutoff/sampleRate;
+            float alpha = sinf(omega)/1.41421356f;    // sin(omega)/(2Q), Q = 1/sqrt(2)
+            float cosine = cosf(omega);
+            float a0 = 1.0f + alpha;
+
+            state->b0 = (1.0f - cosine)*0.5f/a0;
+            state->b1 = (1.0f - cosine)/a0;
+            state->b2 = state->b0;
+            state->a1 = -2.0f*cosine/a0;
+            state->a2 = (1.0f - alpha)/a0;
+        }
+
+        for (int c = 0; c < 2; c++)
+        {
+            float input = frames[frame*2 + c];
+            float output = state->b0*input + state->b1*state->x1[c] + state->b2*state->x2[c] - state->a1*state->y1[c] - state->a2*state->y2[c];
+
+            state->x2[c] = state->x1[c];
+            state->x1[c] = input;
+            state->y2[c] = state->y1[c];
+            state->y1[c] = output;
+
+            frames[frame*2 + c] = output;
+        }
+    }
+}
+
+// Process a reverb effect (Freeverb-style: parallel damped combs + series allpasses)
+// NOTE: Parameter 1: room size, 2: damping, 3: wet level, 4: dry level
+static void ProcessAudioEffectReverb(rAudioEffect *effect, float *frames, ma_uint32 frameCount)
+{
+    ReverbState *state = (ReverbState *)effect->state;
+    float envelope = state->envelope;
+
+    for (ma_uint32 frame = 0; frame < frameCount; frame++)
+    {
+        // Smooth all parameters towards their targets
+        for (int p = 0; p < 4; p++)
+        {
+            effect->smoothedParameter[p] += (effect->parameter[p] - effect->smoothedParameter[p])*AUDIO.System.parameterSmoothing;
+        }
+
+        float room = effect->smoothedParameter[0];
+        float damp = effect->smoothedParameter[1];
+        float wet = effect->smoothedParameter[2];
+        float dry = effect->smoothedParameter[3];
+
+        float feedback = 0.7f + 0.28f*room;
+
+        for (int c = 0; c < 2; c++)
+        {
+            float input = frames[frame*2 + c];
+            float reverberant = input*REVERB_INPUT_GAIN;
+
+            float accum = 0.0f;
+            for (int i = 0; i < REVERB_COMB_COUNT; i++)
+            {
+                float output = state->combBuffer[c][i][state->combIndex[c][i]];
+                state->combStore[c][i] = output*(1.0f - damp) + state->combStore[c][i]*damp;
+                state->combBuffer[c][i][state->combIndex[c][i]] = reverberant + state->combStore[c][i]*feedback;
+                state->combIndex[c][i] = (state->combIndex[c][i] + 1)%state->combLength[c][i];
+                accum += output;
+            }
+
+            for (int i = 0; i < REVERB_ALLPASS_COUNT; i++)
+            {
+                float buffered = state->allpassBuffer[c][i][state->allpassIndex[c][i]];
+                float output = buffered - accum;
+                state->allpassBuffer[c][i][state->allpassIndex[c][i]] = accum + buffered*0.5f;
+                state->allpassIndex[c][i] = (state->allpassIndex[c][i] + 1)%state->allpassLength[c][i];
+                accum = output;
+            }
+
+            frames[frame*2 + c] = wet*accum + dry*input;
+
+            float level = fabsf(wet*accum);
+            envelope = (level > envelope) ? level : envelope*0.9998f;
+        }
+    }
+
+    state->envelope = envelope;
+    effect->tailActive = (envelope > 0.0001f);
+}
+
+// Process an audio effects chain over a frames buffer (stereo, float32)
+static void ProcessAudioEffectChain(rAudioEffect *effect, float *frames, ma_uint32 frameCount)
+{
+    while (effect != NULL)
+    {
+        switch (effect->type)
+        {
+            case AUDIO_EFFECT_LOWPASS: ProcessAudioEffectLowpass(effect, frames, frameCount); break;
+            case AUDIO_EFFECT_REVERB: ProcessAudioEffectReverb(effect, frames, frameCount); break;
+            default: break;
+        }
+
+        effect = effect->next;
+    }
+}
+
+// Check if any effect on the chain still produces output without input (e.g. reverb tail)
+static bool IsAudioEffectChainTailActive(rAudioEffect *effect)
+{
+    while (effect != NULL)
+    {
+        if (effect->tailActive) return true;
+        effect = effect->next;
+    }
+
+    return false;
 }
 
 // Check if an audio buffer is playing, assuming the audio system mutex has been locked

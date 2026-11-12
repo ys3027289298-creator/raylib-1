@@ -474,6 +474,13 @@ typedef struct Wave {
 // NOTE: Actual structs are defined internally in raudio module
 typedef struct rAudioBuffer rAudioBuffer;
 typedef struct rAudioProcessor rAudioProcessor;
+typedef struct rAudioBus rAudioBus;
+typedef struct rAudioEffect rAudioEffect;
+
+// Opaque handles declaration
+// NOTE: Actual structs are defined internally in raudio module
+typedef rAudioBus *AudioBus;                // Audio bus, routes and mixes groups of audio sources
+typedef rAudioEffect *AudioEffect;          // Audio effect, processable on audio streams and buses
 
 // AudioStream, custom audio stream
 typedef struct AudioStream {
@@ -1679,6 +1686,21 @@ RLAPI RayCollision GetRayCollisionQuad(Ray ray, Vector3 p1, Vector3 p2, Vector3 
 //------------------------------------------------------------------------------------
 typedef void (*AudioCallback)(void *bufferData, unsigned int frames);
 
+// Audio effect types
+typedef enum {
+    AUDIO_EFFECT_LOWPASS = 0,       // Low-pass filter, parameter 1: cutoff frequency (Hz)
+    AUDIO_EFFECT_REVERB             // Reverb, parameter 1: room size, 2: damping, 3: wet level, 4: dry level (0..1)
+} AudioEffectType;
+
+// Audio effect parameter identifiers
+// NOTE: Every effect supports up to 4 generic parameters, meaning depends on effect type
+typedef enum {
+    AUDIO_EFFECT_PARAMETER_1 = 0,
+    AUDIO_EFFECT_PARAMETER_2,
+    AUDIO_EFFECT_PARAMETER_3,
+    AUDIO_EFFECT_PARAMETER_4
+} AudioEffectParameter;
+
 // Audio device management functions
 RLAPI void InitAudioDevice(void);                                     // Initialize audio device and context
 RLAPI void CloseAudioDevice(void);                                    // Close the audio device and context
@@ -1756,6 +1778,30 @@ RLAPI void DetachAudioStreamProcessor(AudioStream stream, AudioCallback processo
 
 RLAPI void AttachAudioMixedProcessor(AudioCallback processor); // Attach audio stream processor to the entire audio pipeline, receives frames x 2 samples as 'float' (stereo)
 RLAPI void DetachAudioMixedProcessor(AudioCallback processor); // Detach audio stream processor from the entire audio pipeline
+
+// Audio bus management functions
+RLAPI AudioBus LoadAudioBus(void);                                    // Load audio bus, sources can be routed to it for grouped control
+RLAPI void UnloadAudioBus(AudioBus bus);                              // Unload audio bus, routed sources are moved back to the master bus
+RLAPI bool IsAudioBusValid(AudioBus bus);                             // Check if an audio bus is valid
+RLAPI AudioBus GetMasterAudioBus(void);                               // Get the master audio bus, all buses are finally mixed into it
+RLAPI void SetAudioBusVolume(AudioBus bus, float volume);             // Set volume for an audio bus (1.0 is max level), changes are smoothed
+RLAPI float GetAudioBusVolume(AudioBus bus);                          // Get current volume for an audio bus
+RLAPI void SetAudioBusMuted(AudioBus bus, bool muted);                // Set mute state for an audio bus, transitions are smoothed (no clicks)
+RLAPI bool IsAudioBusMuted(AudioBus bus);                             // Check if an audio bus is muted
+RLAPI void SetSoundAudioBus(Sound sound, AudioBus bus);               // Route a sound to an audio bus, use NULL to route back to the master bus
+
+// Audio effect management functions
+// NOTE: An effect can only be attached to one owner (stream or bus) at a time,
+// attaching an already attached effect detaches it from its previous owner
+RLAPI AudioEffect LoadAudioEffect(int type);                          // Load audio effect of the given type (AudioEffectType)
+RLAPI void UnloadAudioEffect(AudioEffect effect);                     // Unload audio effect, detaching it from its current owner
+RLAPI bool IsAudioEffectValid(AudioEffect effect);                    // Check if an audio effect is valid
+RLAPI void SetAudioEffectParameter(AudioEffect effect, int parameter, float value); // Set audio effect parameter (AudioEffectParameter), changes are smoothed
+RLAPI float GetAudioEffectParameter(AudioEffect effect, int parameter); // Get audio effect parameter current target value
+RLAPI void AttachAudioBusEffect(AudioBus bus, AudioEffect effect);    // Attach audio effect to an audio bus, processes all sources routed to the bus
+RLAPI void DetachAudioBusEffect(AudioBus bus, AudioEffect effect);    // Detach audio effect from its current owner
+RLAPI void AttachAudioStreamEffect(AudioStream stream, AudioEffect effect); // Attach audio effect to an audio stream, processes that source only
+RLAPI void DetachAudioStreamEffect(AudioStream stream, AudioEffect effect); // Detach audio effect from its current owner
 
 #if defined(__cplusplus)
 }
