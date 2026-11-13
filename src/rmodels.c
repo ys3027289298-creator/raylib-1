@@ -71,6 +71,10 @@
 
     #define CGLTF_IMPLEMENTATION
     #include "external/cgltf.h"         // glTF file format loading
+
+    #if defined(SUPPORT_DRACO)
+    #include "external/rdraco.h"        // Draco mesh compression decoding (KHR_draco_mesh_compression)
+    #endif
 #endif
 #if SUPPORT_FILEFORMAT_GLTF_WRITE
     // NOTE: No need for custom allocators, memory buffer provided
@@ -5484,6 +5488,307 @@ static BoneInfo *LoadBoneInfoGLTF(cgltf_skin skin, unsigned int *boneCount)
     return bones;
 }
 
+#if SUPPORT_FILEFORMAT_GLTF && defined(SUPPORT_DRACO)
+// Decode a Draco-compressed glTF primitive (KHR_draco_mesh_compression) and patch it with
+// temporary cgltf accessors pointing to the decoded data, so it can be processed through
+// the standard (uncompressed) attribute loading path, keeping materials, skins,
+// morph targets and node transforms handling unchanged
+//----------------------------------------------------------------------------------------------------
+
+// Decoded data of a single Draco-compressed primitive
+typedef struct DracoPrimitiveData {
+    cgltf_primitive *primitive;         // The patched primitive
+    cgltf_attribute *oldAttributes;     // Original primitive attributes (restored on free)
+    cgltf_size oldAttributesCount;
+    cgltf_accessor *oldIndices;         // Original primitive indices accessor (restored on free)
+    cgltf_attribute *attributes;        // Synthetic attribute list (replaces primitive->attributes)
+    int attributeCount;
+    cgltf_accessor *accessors;          // One accessor per attribute + one extra for indices
+    cgltf_buffer_view *bufferViews;     // One buffer view per accessor
+    cgltf_buffer *buffers;              // One buffer per accessor
+    unsigned char **dataBlocks;         // Decoded native data blocks, one per accessor
+    int dataBlockCount;
+    struct DracoPrimitiveData *next;
+} DracoPrimitiveData;
+
+// Map a decoded Draco attribute component data type to a cgltf component type
+static cgltf_component_type GetCgltfComponentTypeFromDraco(int dracoDataType)
+{
+    switch (dracoDataType)
+    {
+        case RDRACO_DT_INT8: return cgltf_component_type_r_8;
+        case RDRACO_DT_UINT8: return cgltf_component_type_r_8u;
+        case RDRACO_DT_INT16: return cgltf_component_type_r_16;
+        case RDRACO_DT_UINT16: return cgltf_component_type_r_16u;
+        case RDRACO_DT_UINT32: return cgltf_component_type_r_32u;
+        case RDRACO_DT_FLOAT32: return cgltf_component_type_r_32f;
+        default: return cgltf_component_type_invalid;
+    }
+}
+
+// Get the size in bytes of a cgltf component type
+static int GetCgltfComponentTypeSize(cgltf_component_type componentType)
+{
+    switch (componentType)
+    {
+        case cgltf_component_type_r_8:
+        case cgltf_component_type_r_8u: return 1;
+        case cgltf_component_type_r_16:
+        case cgltf_component_type_r_16u: return 2;
+        case cgltf_component_type_r_32u:
+        case cgltf_component_type_r_32f: return 4;
+        default: return 0;
+    }
+}
+
+// Decode one Draco-compressed primitive and build the synthetic accessors for it
+// Returns the decoded data (to be freed with FreeDracoPrimitives()) or NULL on failure
+static DracoPrimitiveData *DecodeDracoPrimitive(cgltf_primitive *primitive, const char *fileName)
+{
+    cgltf_draco_mesh_compression *draco = &primitive->draco_mesh_compression;
+
+    // Validate the compressed data buffer view
+    if ((draco->buffer_view == NULL) || (draco->buffer_view->buffer == NULL) ||
+        (draco->buffer_view->buffer->data == NULL) || (draco->buffer_view->size == 0))
+    {
+        TRACELOG(LOG_WARNING, "MODEL: [%s] Draco-compressed primitive has no valid compressed data bufferView", fileName);
+        return NULL;
+    }
+
+    cgltf_buffer *compressedBuffer = draco->buffer_view->buffer;
+    if (draco->buffer_view->offset + draco->buffer_view->size > compressedBuffer->size)
+    {
+        TRACELOG(LOG_WARNING, "MODEL: [%s] Draco compressed data bufferView exceeds its buffer size, corrupted file?", fileName);
+        return NULL;
+    }
+
+    const unsigned char *compressedData = (const unsigned char *)compressedBuffer->data + draco->buffer_view->offset;
+
+    char decodeError[256] = { 0 };
+    rdracoMesh *dracoMesh = rdracoDecodeMesh(compressedData, (size_t)draco->buffer_view->size, decodeError, sizeof(decodeError));
+
+    if (dracoMesh == NULL)
+    {
+        TRACELOG(LOG_WARNING, "MODEL: [%s] Failed to decode Draco mesh data: %s", fileName, decodeError);
+        return NULL;
+    }
+
+    int pointCount = rdracoGetPointCount(dracoMesh);
+    int indexCount = rdracoGetIndexCount(dracoMesh);
+
+    if ((pointCount <= 0) || (indexCount <= 0))
+    {
+        TRACELOG(LOG_WARNING, "MODEL: [%s] Draco mesh decoded to no geometry (points: %i, indices: %i)", fileName, pointCount, indexCount);
+        rdracoReleaseMesh(dracoMesh);
+        return NULL;
+    }
+
+    int attributeCount = (int)draco->attributes_count;
+    DracoPrimitiveData *decoded = (DracoPrimitiveData *)RL_CALLOC(1, sizeof(DracoPrimitiveData));
+    decoded->primitive = primitive;
+    decoded->oldAttributes = primitive->attributes;
+    decoded->oldAttributesCount = primitive->attributes_count;
+    decoded->oldIndices = primitive->indices;
+    decoded->attributes = (cgltf_attribute *)RL_CALLOC(attributeCount, sizeof(cgltf_attribute));
+    decoded->accessors = (cgltf_accessor *)RL_CALLOC(attributeCount + 1, sizeof(cgltf_accessor));
+    decoded->bufferViews = (cgltf_buffer_view *)RL_CALLOC(attributeCount + 1, sizeof(cgltf_buffer_view));
+    decoded->buffers = (cgltf_buffer *)RL_CALLOC(attributeCount + 1, sizeof(cgltf_buffer));
+    decoded->dataBlocks = (unsigned char **)RL_CALLOC(attributeCount + 1, sizeof(unsigned char *));
+
+    bool decodeOk = true;
+    bool hasPosition = false;
+    int usedAttributes = 0;
+
+    // Decode every attribute declared in the extension attributes map
+    for (int k = 0; k < attributeCount && decodeOk; k++)
+    {
+        // NOTE: cgltf stores the Draco attribute unique id as a CGLTF_PTRINDEX value (id + 1)
+        int uniqueId = (int)((size_t)draco->attributes[k].data - 1);
+        const char *attributeName = (draco->attributes[k].name != NULL)? draco->attributes[k].name : "UNKNOWN";
+
+        int numComponents = 0;
+        int dracoDataType = RDRACO_DT_INVALID;
+        if (!rdracoGetAttributeInfo(dracoMesh, uniqueId, &numComponents, &dracoDataType))
+        {
+            TRACELOG(LOG_WARNING, "MODEL: [%s] Draco attribute '%s' (id %i) declared in glTF not found in compressed stream", fileName, attributeName, uniqueId);
+            continue;
+        }
+
+        cgltf_component_type componentType = GetCgltfComponentTypeFromDraco(dracoDataType);
+        if ((componentType == cgltf_component_type_invalid) || (numComponents < 1) || (numComponents > 4))
+        {
+            TRACELOG(LOG_WARNING, "MODEL: [%s] Draco attribute '%s' data format not supported (components: %i, type: %i)", fileName, attributeName, numComponents, dracoDataType);
+            continue;
+        }
+
+        int entrySize = numComponents*GetCgltfComponentTypeSize(componentType);
+        size_t dataSize = (size_t)pointCount*(size_t)entrySize;
+        unsigned char *attributeData = (unsigned char *)RL_MALLOC(dataSize);
+
+        if (!rdracoReadAttribute(dracoMesh, uniqueId, attributeData, dataSize))
+        {
+            TRACELOG(LOG_WARNING, "MODEL: [%s] Failed to read Draco attribute '%s' data (attribute count mismatch or corrupted stream)", fileName, attributeName);
+            RL_FREE(attributeData);
+            decodeOk = false;
+            break;
+        }
+
+        // Build a synthetic accessor chain so the standard attribute loading path can be reused
+        int slot = usedAttributes++;
+        decoded->dataBlocks[decoded->dataBlockCount++] = attributeData;
+
+        decoded->buffers[slot].data = attributeData;
+        decoded->buffers[slot].size = dataSize;
+
+        decoded->bufferViews[slot].buffer = &decoded->buffers[slot];
+        decoded->bufferViews[slot].offset = 0;
+        decoded->bufferViews[slot].size = dataSize;
+
+        decoded->accessors[slot].component_type = componentType;
+        decoded->accessors[slot].type = (cgltf_type)numComponents;      // cgltf_type enum values match component counts (scalar=1..vec4=4)
+        decoded->accessors[slot].offset = 0;
+        decoded->accessors[slot].count = (cgltf_size)pointCount;
+        decoded->accessors[slot].stride = (cgltf_size)entrySize;
+        decoded->accessors[slot].buffer_view = &decoded->bufferViews[slot];
+
+        decoded->attributes[slot].name = draco->attributes[k].name;
+        decoded->attributes[slot].type = draco->attributes[k].type;
+        decoded->attributes[slot].index = draco->attributes[k].index;
+        decoded->attributes[slot].data = &decoded->accessors[slot];
+
+        if (draco->attributes[k].type == cgltf_attribute_type_position) hasPosition = true;
+    }
+
+    // Decode the triangle indices
+    if (decodeOk)
+    {
+        if (!hasPosition)
+        {
+            TRACELOG(LOG_WARNING, "MODEL: [%s] Draco mesh has no POSITION attribute, mesh can not be loaded", fileName);
+            decodeOk = false;
+        }
+        else
+        {
+            unsigned int *indices32 = (unsigned int *)RL_MALLOC((size_t)indexCount*sizeof(unsigned int));
+
+            if (!rdracoReadIndices(dracoMesh, indices32, (size_t)indexCount))
+            {
+                TRACELOG(LOG_WARNING, "MODEL: [%s] Failed to read Draco mesh indices (corrupted stream)", fileName);
+                RL_FREE(indices32);
+                decodeOk = false;
+            }
+            else
+            {
+                // Check if indices fit in 16 bits to provide them in the best supported format
+                bool fits16 = true;
+                for (int k = 0; k < indexCount; k++)
+                {
+                    if (indices32[k] > 65535) { fits16 = false; break; }
+                    if (indices32[k] >= (unsigned int)pointCount)
+                    {
+                        TRACELOG(LOG_WARNING, "MODEL: [%s] Draco mesh index %u out of range (vertex count: %i), corrupted stream", fileName, indices32[k], pointCount);
+                        decodeOk = false;
+                        break;
+                    }
+                }
+
+                if (decodeOk)
+                {
+                    int slot = usedAttributes;
+                    cgltf_size indexDataSize = 0;
+
+                    if (fits16)
+                    {
+                        unsigned short *indices16 = (unsigned short *)RL_MALLOC((size_t)indexCount*sizeof(unsigned short));
+                        for (int k = 0; k < indexCount; k++) indices16[k] = (unsigned short)indices32[k];
+                        indexDataSize = (cgltf_size)indexCount*sizeof(unsigned short);
+                        decoded->dataBlocks[decoded->dataBlockCount++] = (unsigned char *)indices16;
+                        decoded->accessors[slot].component_type = cgltf_component_type_r_16u;
+                        decoded->accessors[slot].stride = sizeof(unsigned short);
+                    }
+                    else
+                    {
+                        indexDataSize = (cgltf_size)indexCount*sizeof(unsigned int);
+                        decoded->dataBlocks[decoded->dataBlockCount++] = (unsigned char *)indices32;
+                        indices32 = NULL;   // Ownership transferred
+                        decoded->accessors[slot].component_type = cgltf_component_type_r_32u;
+                        decoded->accessors[slot].stride = sizeof(unsigned int);
+                    }
+
+                    RL_FREE(indices32);
+
+                    decoded->buffers[slot].data = decoded->dataBlocks[decoded->dataBlockCount - 1];
+                    decoded->buffers[slot].size = indexDataSize;
+
+                    decoded->bufferViews[slot].buffer = &decoded->buffers[slot];
+                    decoded->bufferViews[slot].offset = 0;
+                    decoded->bufferViews[slot].size = indexDataSize;
+
+                    decoded->accessors[slot].type = cgltf_type_scalar;
+                    decoded->accessors[slot].offset = 0;
+                    decoded->accessors[slot].count = (cgltf_size)indexCount;
+                    decoded->accessors[slot].buffer_view = &decoded->bufferViews[slot];
+
+                    primitive->indices = &decoded->accessors[slot];
+                }
+                else RL_FREE(indices32);
+            }
+        }
+    }
+
+    // The decoded Draco mesh is not needed any more, all data has been extracted
+    rdracoReleaseMesh(dracoMesh);
+
+    if (!decodeOk)
+    {
+        // Restore the original primitive data before leaving
+        primitive->attributes = decoded->oldAttributes;
+        primitive->attributes_count = decoded->oldAttributesCount;
+        primitive->indices = decoded->oldIndices;
+
+        for (int k = 0; k < decoded->dataBlockCount; k++) RL_FREE(decoded->dataBlocks[k]);
+        RL_FREE(decoded->dataBlocks);
+        RL_FREE(decoded->attributes);
+        RL_FREE(decoded->accessors);
+        RL_FREE(decoded->bufferViews);
+        RL_FREE(decoded->buffers);
+        RL_FREE(decoded);
+        return NULL;
+    }
+
+    // Patch the primitive so it flows through the standard loading path
+    decoded->attributeCount = usedAttributes;
+    primitive->attributes = decoded->attributes;
+    primitive->attributes_count = (cgltf_size)usedAttributes;
+
+    return decoded;
+}
+
+// Free all decoded Draco primitive data
+static void FreeDracoPrimitives(DracoPrimitiveData *dracoPrimitives)
+{
+    while (dracoPrimitives != NULL)
+    {
+        DracoPrimitiveData *next = dracoPrimitives->next;
+
+        // Restore the original primitive data (owned by cgltf) before freeing the decoded one
+        dracoPrimitives->primitive->attributes = dracoPrimitives->oldAttributes;
+        dracoPrimitives->primitive->attributes_count = dracoPrimitives->oldAttributesCount;
+        dracoPrimitives->primitive->indices = dracoPrimitives->oldIndices;
+
+        for (int k = 0; k < dracoPrimitives->dataBlockCount; k++) RL_FREE(dracoPrimitives->dataBlocks[k]);
+        RL_FREE(dracoPrimitives->dataBlocks);
+        RL_FREE(dracoPrimitives->attributes);
+        RL_FREE(dracoPrimitives->accessors);
+        RL_FREE(dracoPrimitives->bufferViews);
+        RL_FREE(dracoPrimitives->buffers);
+        RL_FREE(dracoPrimitives);
+        dracoPrimitives = next;
+    }
+}
+//----------------------------------------------------------------------------------------------------
+#endif
+
 // Load glTF file into model struct, .gltf and .glb supported
 static Model LoadGLTF(const char *fileName)
 {
@@ -5500,6 +5805,8 @@ static Model LoadGLTF(const char *fileName)
                      PBR specular/glossiness flow and extended texture flows not supported
           - Supports multiple meshes per model (every primitives is loaded as a separate mesh)
           - Supports basic animations
+          - Supports Draco-compressed meshes (KHR_draco_mesh_compression) when built
+            with SUPPORT_DRACO and the Draco library (https://github.com/google/draco)
           - Transforms, including parent-child relations, are applied on the mesh data,
             but the hierarchy is not kept (as it can't be represented)
           - Mesh instances in the glTF file (a.e. same mesh linked from multiple nodes)
@@ -5567,7 +5874,57 @@ static Model LoadGLTF(const char *fileName)
         if (result != cgltf_result_success) TRACELOG(LOG_INFO, "MODEL: [%s] Failed to load mesh/material buffers", fileName);
 
         int primitivesCount = 0;
+
+#if defined(SUPPORT_DRACO)
+        // Decode all Draco-compressed primitives (KHR_draco_mesh_compression) up-front,
+        // patching them with temporary accessors so they flow through the standard
+        // attribute loading path below; primitives that fail to decode are skipped
+        DracoPrimitiveData *dracoPrimitives = NULL;
+        {
+            bool dracoExtensionDeclared = false;
+            for (cgltf_size e = 0; e < data->extensions_used_count; e++)
+            {
+                if ((data->extensions_used[e] != NULL) && (strcmp(data->extensions_used[e], "KHR_draco_mesh_compression") == 0))
+                {
+                    dracoExtensionDeclared = true;
+                    break;
+                }
+            }
+
+            bool dracoExtensionWarningDone = false;
+            for (unsigned int i = 0; i < data->meshes_count; i++)
+            {
+                for (unsigned int p = 0; p < data->meshes[i].primitives_count; p++)
+                {
+                    cgltf_primitive *primitive = &data->meshes[i].primitives[p];
+                    if (!primitive->has_draco_mesh_compression) continue;
+
+                    if (!dracoExtensionDeclared && !dracoExtensionWarningDone)
+                    {
+                        TRACELOG(LOG_WARNING, "MODEL: [%s] Draco mesh compression used but 'KHR_draco_mesh_compression' is not declared in extensionsUsed", fileName);
+                        dracoExtensionWarningDone = true;
+                    }
+
+                    if (primitive->type != cgltf_primitive_type_triangles) continue;
+
+                    DracoPrimitiveData *decoded = DecodeDracoPrimitive(primitive, fileName);
+                    if (decoded != NULL)
+                    {
+                        decoded->next = dracoPrimitives;
+                        dracoPrimitives = decoded;
+                    }
+                    else
+                    {
+                        // Mark the primitive as not loadable so it is skipped by the
+                        // counting/loading loops below (error already logged)
+                        primitive->type = cgltf_primitive_type_points;
+                    }
+                }
+            }
+        }
+#else
         bool dracoCompression = false;
+#endif
 
         // NOTE: Load every primitive in the glTF as a separate raylib Mesh
         // Determine total number of meshes needed from the node hierarchy
@@ -5581,21 +5938,32 @@ static Model LoadGLTF(const char *fileName)
             {
                 if (mesh->primitives[p].has_draco_mesh_compression)
                 {
+#if defined(SUPPORT_DRACO)
+                    // Draco-compressed primitives already decoded above (or marked as not loadable)
+                    if (mesh->primitives[p].type == cgltf_primitive_type_triangles) primitivesCount++;
+#else
                     dracoCompression = true;
-                    TRACELOG(LOG_WARNING, "MODEL: [%s] Failed to load mesh data, Draco compression not supported", fileName);
-                    break;
+                    TRACELOG(LOG_WARNING, "MODEL: [%s] Draco-compressed mesh found but Draco support is not enabled (SUPPORT_DRACO), mesh skipped", fileName);
+#endif
                 }
                 else if (mesh->primitives[p].type == cgltf_primitive_type_triangles) primitivesCount++;
             }
         }
 
+#if !defined(SUPPORT_DRACO)
         if (dracoCompression)
         {
-            TRACELOG(LOG_WARNING, "MODEL: [%s] Failed to load glTF data", fileName);
-            cgltf_free(data);
-            UnloadFileData(fileData);
-            return model;
+            if (primitivesCount == 0)
+            {
+                TRACELOG(LOG_WARNING, "MODEL: [%s] Failed to load glTF data, all meshes require Draco compression support (SUPPORT_DRACO)", fileName);
+                cgltf_free(data);
+                UnloadFileData(fileData);
+                return model;
+            }
+
+            TRACELOG(LOG_WARNING, "MODEL: [%s] Some meshes require Draco compression support (SUPPORT_DRACO) and were skipped", fileName);
         }
+#endif
 
         TRACELOG(LOG_DEBUG, "    > Primitives (triangles only) count based on hierarchy : %i", primitivesCount);
 
@@ -5762,6 +6130,11 @@ static Model LoadGLTF(const char *fileName)
                 // NOTE: Only support primitives defined by triangles
                 // Other alternatives: points, lines, line_strip, triangle_strip
                 if (mesh->primitives[p].type != cgltf_primitive_type_triangles) continue;
+
+#if !defined(SUPPORT_DRACO)
+                // Skip Draco-compressed primitives when Draco support is not enabled (already logged)
+                if (mesh->primitives[p].has_draco_mesh_compression) continue;
+#endif
 
                 // NOTE: Attributes data could be provided in several data formats (8, 8u, 16u, 32...),
                 // Only some formats for each attribute type are supported, read info at the top of this function!
@@ -6284,6 +6657,11 @@ static Model LoadGLTF(const char *fileName)
                 // NOTE: Only support primitives defined by triangles
                 if (mesh->primitives[p].type != cgltf_primitive_type_triangles) continue;
 
+#if !defined(SUPPORT_DRACO)
+                // Skip Draco-compressed primitives when Draco support is not enabled (already logged)
+                if (mesh->primitives[p].has_draco_mesh_compression) continue;
+#endif
+
                 for (unsigned int j = 0; j < mesh->primitives[p].attributes_count; j++)
                 {
                     // NOTE: JOINTS_1 + WEIGHT_1 will be used for +4 joints influencing a vertex -> Not supported by raylib
@@ -6421,6 +6799,11 @@ static Model LoadGLTF(const char *fileName)
                 meshIndex++; // Move to next mesh
             }
         }
+
+#if defined(SUPPORT_DRACO)
+        // All Draco-decoded data has been consumed by the standard loading path, free it
+        FreeDracoPrimitives(dracoPrimitives);
+#endif
 
         // Initialize runtime animation data: current pose and bone matrices
         model.currentPose = (Transform *)RL_CALLOC(model.skeleton.boneCount, sizeof(Transform));

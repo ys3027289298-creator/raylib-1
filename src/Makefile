@@ -117,6 +117,12 @@ RAYLIB_MODULE_RAYGUI_PATH ?= $(RAYLIB_SRC_PATH)/../../raygui/src
 # Use external GLFW library instead of rglfw module
 USE_EXTERNAL_GLFW     ?= FALSE
 
+# Enable Draco mesh compression support (KHR_draco_mesh_compression) in the glTF loader
+# NOTE: It requires the Draco library (https://github.com/google/draco), C++,
+#       set DRACO_ROOT to the Draco install prefix if it is not in the default search paths
+SUPPORT_DRACO        ?= FALSE
+DRACO_ROOT           ?= /usr/local
+
 # Enable support for X11 by default on Linux when using GLFW
 # NOTE: Wayland is disabled by default, only enable if you are sure
 GLFW_LINUX_ENABLE_WAYLAND  ?= FALSE
@@ -437,6 +443,13 @@ ifeq ($(TARGET_PLATFORM),PLATFORM_WEB_RGFW)
         CFLAGS += --profiling
     endif
 endif
+
+# Draco mesh compression support (requires the Draco library, C++)
+ifeq ($(SUPPORT_DRACO),TRUE)
+    CFLAGS += -DSUPPORT_DRACO -I$(DRACO_ROOT)/include
+    LDLIBS += -L$(DRACO_ROOT)/lib -ldraco -lstdc++
+endif
+
 ifeq ($(TARGET_PLATFORM),PLATFORM_ANDROID)
     # Compiler flags for arquitecture
     ifeq ($(ANDROID_ARCH),arm)
@@ -761,6 +774,9 @@ endif
 ifeq ($(RAYLIB_MODULE_MODELS),TRUE)
     OBJS += rmodels.o
 endif
+ifeq ($(SUPPORT_DRACO),TRUE)
+    OBJS += rdraco.o
+endif
 ifeq ($(RAYLIB_MODULE_AUDIO),TRUE)
     OBJS += raudio.o
 endif
@@ -871,6 +887,10 @@ rtext.o : rtext.c raylib.h
 # Compile models module
 rmodels.o : rmodels.c raylib.h rlgl.h raymath.h
 	$(CC) -c $< $(CFLAGS) $(INCLUDE_PATHS)
+
+# Compile Draco decoder wrapper (C++), only used when SUPPORT_DRACO=TRUE
+rdraco.o : external/rdraco.cpp external/rdraco.h
+	$(CXX) -std=c++11 -c $< -o $@ $(filter-out -std=%,$(CFLAGS)) $(INCLUDE_PATHS)
 
 # Compile audio module
 raudio.o : raudio.c raylib.h

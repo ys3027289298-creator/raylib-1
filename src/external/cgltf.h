@@ -6709,10 +6709,11 @@ static int cgltf_fixup_pointers(cgltf_data* data)
 			if (data->meshes[i].primitives[j].has_draco_mesh_compression)
 			{
 				CGLTF_PTRFIXUP_REQ(data->meshes[i].primitives[j].draco_mesh_compression.buffer_view, data->buffer_views, data->buffer_views_count);
-				for (cgltf_size m = 0; m < data->meshes[i].primitives[j].draco_mesh_compression.attributes_count; ++m)
-				{
-					CGLTF_PTRFIXUP_REQ(data->meshes[i].primitives[j].draco_mesh_compression.attributes[m].data, data->accessors, data->accessors_count);
-				}
+				// NOTE: KHR_draco_mesh_compression attribute values are Draco attribute unique ids
+				// inside the compressed bitstream, NOT glTF accessor indices, so they must not be
+				// fixed up against data->accessors (doing so would also reject valid files where
+				// the id is out of the accessors array range). They are kept as raw ids (stored
+				// as CGLTF_PTRINDEX) to be consumed by the Draco decoder. (raylib patch)
 			}
 
 			for (cgltf_size k = 0; k < data->meshes[i].primitives[j].mappings_count; ++k)

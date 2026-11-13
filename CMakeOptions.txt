@@ -30,6 +30,9 @@ option(GLFW_BUILD_X11 "Build the bundled GLFW with X11 support" ON)
 
 option(INCLUDE_EVERYTHING "Include everything disabled by default (for CI usage)" OFF)
 
+option(SUPPORT_DRACO "Enable Draco mesh compression support in the glTF loader (requires the Draco library)" OFF)
+set(DRACO_ROOT "" CACHE PATH "Path to a Draco library installation (optional, used to locate draco headers/library)")
+
 include(ParseConfigHeader)
 
 foreach(FLAG IN LISTS CONFIG_HEADER_FLAGS)

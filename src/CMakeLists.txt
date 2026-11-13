@@ -46,6 +46,28 @@ if (NOT DEFINED SUPPORT_MODULE_RMODELS OR SUPPORT_MODULE_RMODELS)
     list(APPEND raylib_sources rmodels.c)
 endif()
 
+# Optional Draco mesh compression support (KHR_draco_mesh_compression) for the glTF loader
+# Requires the Draco library (https://github.com/google/draco), C++
+if (SUPPORT_DRACO)
+    enable_language(CXX)
+
+    # Try a Draco CMake package config first, then fall back to manual lookup
+    find_package(draco CONFIG QUIET)
+    if (NOT draco_FOUND)
+        find_path(DRACO_INCLUDE_DIR draco/compression/decode.h HINTS "${DRACO_ROOT}" PATH_SUFFIXES include)
+        find_library(DRACO_LIBRARY NAMES draco HINTS "${DRACO_ROOT}" PATH_SUFFIXES lib)
+        if (NOT DRACO_INCLUDE_DIR OR NOT DRACO_LIBRARY)
+            message(FATAL_ERROR "SUPPORT_DRACO is ON but the Draco library was not found. Set DRACO_ROOT to the Draco install prefix.")
+        endif()
+        add_library(draco::draco UNKNOWN IMPORTED)
+        set_target_properties(draco::draco PROPERTIES
+            IMPORTED_LOCATION "${DRACO_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${DRACO_INCLUDE_DIR}")
+    endif()
+
+    list(APPEND raylib_sources external/rdraco.cpp)
+endif()
+
 # <root>/cmake/GlfwImport.cmake handles the details around the inclusion of glfw
 if (NOT ${PLATFORM} MATCHES "Web")
     include(GlfwImport)
@@ -63,6 +85,12 @@ else ()
 endif ()
 
 add_library(raylib ${raylib_sources} ${raylib_public_headers})
+
+if (SUPPORT_DRACO)
+    target_compile_definitions(raylib PRIVATE SUPPORT_DRACO)
+    target_link_libraries(raylib PRIVATE draco::draco)
+    message(STATUS "glTF loader: Draco mesh compression support enabled")
+endif()
 
 if (NOT BUILD_SHARED_LIBS)
     MESSAGE(STATUS "Building raylib static library")

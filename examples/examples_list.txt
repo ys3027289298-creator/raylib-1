@@ -163,6 +163,7 @@ models;models_mesh_generation;★★☆☆;1.8;4.0;2017;2025;"Ramon Santamaria";
 models;models_mesh_picking;★★★☆;1.7;4.0;2017;2025;"Joel Davis";@joeld42
 models;models_loading;★☆☆☆;2.0;4.2;2014;2025;"Ramon Santamaria";@raysan5
 models;models_loading_gltf;★☆☆☆;3.7;4.2;2020;2025;"Ramon Santamaria";@raysan5
+models;models_loading_draco;★☆☆☆;6.5;6.5;2026;2026;"raylib technologies";@raylibtech
 models;models_loading_vox;★☆☆☆;4.0;4.0;2021;2025;"Johann Nadalutti";@procfxgen
 models;models_loading_m3d;★★☆☆;4.5;4.5;2022;2025;"bzt";@bztsrc
 models;models_orthographic_projection;★☆☆☆;2.0;3.7;2018;2025;"Max Danielsson";@autious
